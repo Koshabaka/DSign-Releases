@@ -1,0 +1,80 @@
+name: Publish macOS installation guide once
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/publish-macos-guide-once.yml']
+permissions:
+  contents: write
+concurrency:
+  group: publish-dsign-macos-beta5-guide
+  cancel-in-progress: false
+jobs:
+  publish-guide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DOC_COMMIT: ${{ github.sha }}
+    steps:
+      - name: Attach approved guide and append release links
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, urllib.request
+          repo = 'Koshabaka/DSign-Releases'
+          tag = 'v0.1.1-macos-beta.5'
+          release_id = 439527409
+          doc_path = 'docs/macos/0.1.1-macos-beta.5/DSign_macOS_installation_RU.md'
+          name = 'DSign_macOS_installation_RU.md'
+          expected_sha = '4648a8cc7a67152b791ba6d5bce3bfaa77e52d871944aafb1d8225f0188cb308'
+          protected = {"DSign-macOS-0.1.1-macos-beta.5-arm64.dmg":{"id":728640695,"size":51152654,"digest":"sha256:c776b42d52a7d82b82e89cb27a592ebc9f762d1c712320aee3d654591cb75e14"},"DSign-macOS-0.1.1-macos-beta.5-arm64.dmg.sha256":{"id":728640699,"size":107,"digest":"sha256:90b2f7f943b00dbb4a46f7cf513687e574f0c1f92a78fa1066f4c05e0a612ace"},"DSign-macOS-0.1.1-macos-beta.5-x64.dmg":{"id":728640697,"size":52701217,"digest":"sha256:130d6f39c4905def7cc44935408716e5a3a3ef59bbe3e301b35f084356fa4983"},"DSign-macOS-0.1.1-macos-beta.5-x64.dmg.sha256":{"id":728640702,"size":105,"digest":"sha256:5f653b38485f05ca24451b5b7e02087ba29400e4affb470324bc4ec0b58d5e72"}}
+          def call(path, method='GET', data=None, upload=False):
+              host = 'https://uploads.github.com' if upload else 'https://api.github.com'
+              headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+              if data is not None:
+                  if isinstance(data, bytes): headers['Content-Type'] = 'text/markdown; charset=utf-8'
+                  else:
+                      headers['Content-Type'] = 'application/json'
+                      data = json.dumps(data, ensure_ascii=False).encode('utf-8')
+              request = urllib.request.Request(host + path, data=data, headers=headers, method=method)
+              with urllib.request.urlopen(request, timeout=45) as response:
+                  return json.load(response)
+          def verify_installers(release):
+              assert release['id'] == release_id and release['tag_name'] == tag
+              assert release['draft'] is False and release['prerelease'] is True
+              by_name = {asset['name']: asset for asset in release['assets']}
+              for filename, expected in protected.items():
+                  assert filename in by_name, 'An original installer or checksum is missing'
+                  assert all(by_name[filename][key] == value for key, value in expected.items()), 'Original asset changed'
+              return by_name
+          endpoint = f'/repos/{repo}/releases/{release_id}'
+          before = call(endpoint)
+          assets = verify_installers(before)
+          assert before.get('immutable') is not True, 'Release is immutable'
+          commit = os.environ['DOC_COMMIT']
+          source = call(f'/repos/{repo}/contents/{doc_path}?ref={commit}')
+          assert source['encoding'] == 'base64'
+          document = base64.b64decode(source['content'])
+          assert hashlib.sha256(document).hexdigest() == expected_sha, 'Guide content differs from approved file'
+          if name in assets:
+              assert assets[name]['digest'] == 'sha256:' + expected_sha, 'A different guide already exists'
+          else:
+              call(f'/repos/{repo}/releases/{release_id}/assets?name={name}', 'POST', document, upload=True)
+          current = call(endpoint)
+          assets = verify_installers(current)
+          assert assets[name]['digest'] == 'sha256:' + expected_sha and assets[name]['size'] == len(document)
+          read_url = f'https://github.com/{repo}/blob/{commit}/{doc_path}'
+          download_url = assets[name]['browser_download_url']
+          marker = '<!-- dsign-macos-install-guide:v0.1.1-macos-beta.5 -->'
+          body = current.get('body') or ''
+          if marker not in body:
+              section = f'\n\n{marker}\n## Инструкция по установке на macOS\n\n[Читать инструкцию на GitHub]({read_url}) · [Скачать инструкцию в Markdown]({download_url})\n\nВыбор Apple Silicon/Intel, проверка SHA-256, первый запуск по рекомендациям Apple, устранение ошибок и ограничения бета-версии.\n'
+              body = body.rstrip() + section
+              call(endpoint, 'PATCH', {'body': body})
+          else:
+              assert download_url in body and '/docs/macos/0.1.1-macos-beta.5/' in body, 'Unexpected existing guide section'
+          final = call(endpoint)
+          verify_installers(final)
+          assert final['body'] == body and marker in final['body'] and download_url in final['body']
+          print('Published and verified macOS installation guide; original DMG and SHA-256 assets unchanged.')
+          PY
